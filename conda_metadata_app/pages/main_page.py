@@ -16,8 +16,9 @@ from conda_forge_metadata.types import ArtifactData
 from rattler.platform import PlatformLiteral
 from requests.auth import HTTPBasicAuth
 
-from app_config import AppConfig, Channel, PackageDiscoveryChoice, ArchSubdirDiscoveryChoice, ArchSubdirList, \
-    ArtifactDiscoveryChoice, MetadataRetrieval, Secret
+from conda_metadata_app.app_config import (AppConfig, Channel, PackageDiscoveryChoice, ArchSubdirDiscoveryChoice,
+                                           ArchSubdirList, ArtifactDiscoveryChoice, MetadataRetrieval, Secret)
+from conda_metadata_app.version_order import VersionOrder
 
 if not os.environ.get("CACHE_DIR"):
     from conda_oci_mirror import defaults
@@ -35,8 +36,6 @@ from conda_package_streaming.url import conda_reader_for_url
 from ruamel.yaml import YAML
 from streamlit.logger import get_logger
 from xml.etree import ElementTree as ET
-
-from version_order import VersionOrder
 
 
 yaml = YAML(typ="safe")
@@ -143,10 +142,11 @@ def get_repodata(channel_name: str, arch_subdir: str) -> dict:
     it falls back to the uncompressed.
     """
     decompressed_repodata = _download_compressed_repodata(channel_name, arch_subdir)
-    channel_config = get_channel_config(channel_name)
 
     if decompressed_repodata is not None:
         return decompressed_repodata
+
+    channel_config = get_channel_config(channel_name)
 
     # fall back to the uncompressed version
     repodata_url = channel_config.get_repodata_url(arch_subdir)
@@ -156,15 +156,30 @@ def get_repodata(channel_name: str, arch_subdir: str) -> dict:
     return r.json()
 
 
-def get_all_packages_sections_from_repodata(channel_name: str, arch_subdir: str) -> dict:
+def get_all_packages_sections_from_repodata(channel_name: str, arch_subdir: str, with_broken: bool) -> dict:
     """
     Contains the "packages" and "packages.conda" sections of the repodata.
+
+    If with_broken is True, name, version, build, and build_number of broken packages are included by performing string operations
+    on the artifact names in the "removed" section of the repodata, if exists.
     """
     sections = {}
     repodata = get_repodata(channel_name, arch_subdir)
     for key in ("packages", "packages.conda"):
         if key in repodata:
             sections.update(repodata[key])
+
+    if with_broken:
+        for removed_artifact in get_repodata(channel, arch_subdir).get("removed", []):
+            removed_artifact: str
+            artifact_basename, artifact_extension = removed_artifact.rsplit(".", 1)
+            artifact_name, artifact_version, artifact_build = artifact_basename.rsplit("-", 2)
+            sections[removed_artifact] = {
+                "name": artifact_name,
+                "version": artifact_version,
+                "build": artifact_build,
+                "build_number": artifact_build.split("_")[-1],
+            }
     return sections
 
 
@@ -244,7 +259,7 @@ def get_package_names(channel_name: str) -> list[str]:
 
         for subdir in all_subdirs:
             all_packages.update(
-                pkg["name"] for pkg in get_all_packages_sections_from_repodata(channel_name, subdir).values()
+                pkg["name"] for pkg in get_all_packages_sections_from_repodata(channel_name, subdir, with_broken=True).values()
             )
     else:
         raise RuntimeError("Invalid package discovery choice. This is an implementation error.")
@@ -367,7 +382,7 @@ def get_versions(channel_name: str, subdir: str, package_name: str, with_broken:
             and (with_broken or "broken" not in pkg["labels"])
         }
     elif discovery_choice == ArtifactDiscoveryChoice.REPODATA:
-        repodata_pkg = get_all_packages_sections_from_repodata(channel_name, subdir)
+        repodata_pkg = get_all_packages_sections_from_repodata(channel_name, subdir, with_broken=with_broken)
         all_versions = {
             pkg["version"]
             for pkg in repodata_pkg.values()
@@ -399,12 +414,12 @@ def _build_mapping_from_anaconda_api(package_name: str, subdir: str, version: st
     }
 
 
-def _build_mapping_from_repodata(package_name: str, subdir: str, version: str, channel: str) -> dict[str, int]:
+def _build_mapping_from_repodata(package_name: str, subdir: str, version: str, channel: str, with_broken: bool) -> dict[str, int]:
     """
     Note: This function cannot consider labels as they are not present in the repodata.
     Returns a mapping from build string to build number.
     """
-    repodata_packages = get_all_packages_sections_from_repodata(channel, subdir)
+    repodata_packages = get_all_packages_sections_from_repodata(channel, subdir, with_broken)
 
     return {
         pkg["build"]: pkg["build_number"]
@@ -424,7 +439,7 @@ def builds(package_name: str, subdir: str, version: str, channel: str, with_brok
     if discovery_choice == ArtifactDiscoveryChoice.ANACONDA_API:
         build_str_to_num = _build_mapping_from_anaconda_api(package_name, subdir, version, channel, with_broken)
     elif discovery_choice == ArtifactDiscoveryChoice.REPODATA:
-        build_str_to_num = _build_mapping_from_repodata(package_name, subdir, version, channel)
+        build_str_to_num = _build_mapping_from_repodata(package_name, subdir, version, channel, with_broken)
     else:
         raise RuntimeError("Invalid artifact discovery choice. This is an implementation error.")
 
@@ -450,11 +465,9 @@ def _extensions_from_anaconda_api(package_name: str, subdir: str, version: str, 
     }
 
 
-def _extensions_from_repodata(package_name: str, subdir: str, version: str, build: str, channel: str) -> set[str]:
-    """
-    with_broken cannot be considered here as repodata does not include yanked packages.
-    """
-    repodata_packages = get_all_packages_sections_from_repodata(channel, subdir)
+def _extensions_from_repodata(package_name: str, subdir: str, version: str, build: str, channel: str, with_broken: bool) -> set[str]:
+    repodata_packages = get_all_packages_sections_from_repodata(channel, subdir, with_broken)
+
     return {
         ("conda" if filename.endswith(".conda") else "tar.bz2")
         for filename, pkg in repodata_packages.items()
@@ -476,24 +489,43 @@ def extensions(package_name: str, subdir: str, version: str, build: str, channel
     if discovery_choice == ArtifactDiscoveryChoice.ANACONDA_API:
         return sorted(_extensions_from_anaconda_api(package_name, subdir, version, build, channel, with_broken))
     if discovery_choice == ArtifactDiscoveryChoice.REPODATA:
-        return sorted(_extensions_from_repodata(package_name, subdir, version, build, channel))
+        return sorted(_extensions_from_repodata(package_name, subdir, version, build, channel, with_broken))
     raise RuntimeError("Invalid artifact discovery choice. This is an implementation error.")
+
+
+def _is_broken_anaconda_api(package_name: str, subdir: str, version: str, build: str, extension: str, channel: str) -> bool:
+    channel_config = get_channel_config(channel)
+    if not channel_config.supports_broken_label:
+        return False
+
+    data = anaconda_api_data(package_name, channel)
+    for pkg in data:
+        if (
+                pkg["attrs"]["subdir"] == subdir
+                and pkg["version"] == version
+                and pkg["attrs"]["build"] == build
+                and pkg["basename"].endswith(extension)
+        ):
+            return "broken" in pkg["labels"]
+    return False
+
+
+def _is_broken_repodata(package_name: str, subdir: str, version: str, build: str, extension: str, channel: str) -> bool:
+    repodata = get_repodata(channel, subdir)
+
+    artifact_name = f"{package_name}-{version}-{build}.{extension}"
+
+    return artifact_name in repodata.get("removed", [])
 
 
 def _is_broken(package_name: str, subdir: str, version: str, build: str, extension: str, channel: str) -> bool:
     channel_config = get_channel_config(channel)
-    if channel_config.artifact_discovery != ArtifactDiscoveryChoice.ANACONDA_API or not channel_config.supports_broken_label:
-        return False  # we don't know
-    data = anaconda_api_data(package_name, channel)
-    for pkg in data:
-        if (
-            pkg["attrs"]["subdir"] == subdir
-            and pkg["version"] == version
-            and pkg["attrs"]["build"] == build
-            and pkg["basename"].endswith(extension)
-        ):
-            return "broken" in pkg["labels"]
-    return False
+    if channel_config.artifact_discovery == ArtifactDiscoveryChoice.ANACONDA_API:
+        return _is_broken_anaconda_api(package_name, subdir, version, build, extension, channel)
+    if channel_config.artifact_discovery == ArtifactDiscoveryChoice.REPODATA:
+        return _is_broken_repodata(package_name, subdir, version, build, extension, channel)
+    raise RuntimeError("Invalid artifact discovery choice. This is an implementation error.")
+
 
 
 def patched_repodata(channel: str, subdir: str, artifact: str) -> tuple[dict, bool]:
@@ -681,7 +713,7 @@ with st.sidebar:
         "Include artifacts marked broken",
         value=False,
         key="with_broken",
-        help="Include broken packages in the list of versions and builds. Does not have any effect if the artifact discovery is set to 'repodata'.",
+        help="Include broken packages in the list of versions and builds.",
     )
 
     with_patches: bool = False
@@ -707,11 +739,6 @@ with st.sidebar:
         # Use the user provided channel (via query params) if possible.
         index=_all_channels.index(url_params["channel"]) if url_params["channel"] in _all_channels else 0,
     )
-
-    if get_channel_config(channel).artifact_discovery == ArtifactDiscoveryChoice.REPODATA and with_broken:
-        st.warning(
-            "The inclusion of broken artifacts option is ignored for channels that use repodata for artifact discovery."
-        )
 
     _available_package_names = [""] + get_package_names(channel)    # empty string means: show RSS feed
     package_name = st.selectbox(
